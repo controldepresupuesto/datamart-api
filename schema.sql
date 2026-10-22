@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS datamart (
 
 CREATE INDEX IF NOT EXISTS idx_dm_ep_emp ON datamart (endpoint, empresa);
 CREATE INDEX IF NOT EXISTS idx_dm_gin    ON datamart USING GIN (data);
+-- (22-oct-2026) La paginacion WHERE endpoint=X ORDER BY id LIMIT/OFFSET recorria la llave primaria entera buscando
+-- el endpoint: contratos.actas?limit=1, 886 ms. Con este indice, 2,8 ms. Lo crea tambien el motor (destino_datamart.py).
+CREATE INDEX IF NOT EXISTS idx_dm_ep_id  ON datamart (endpoint, id);
 
 -- Control de sincronizacion: que se cargo, cuando, cuantas filas, si fallo.
 CREATE TABLE IF NOT EXISTS sync_log (

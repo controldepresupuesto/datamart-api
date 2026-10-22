@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-main.py - API de consultas del DataMart. Se despliega en Railway.
+main.py - API de consultas del DataMart. Se despliega en Oracle (Coolify, desde este repositorio, rama main).
 Lee de PostgreSQL y entrega JSON limpio para Claude y Power BI.
 
 Endpoints:
@@ -15,13 +15,19 @@ Endpoints:
          limit=N (def 500)      maximo de filas
          offset=N               paginacion
          <campo>=<valor>        filtro exacto por campo del registro (ej: ?Vigente=SI)
+         <campo>=<v1>&<campo>=<v2>  VARIOS valores del mismo campo: filas con cualquiera de ellos
+                                (22-oct-2026; antes solo valia el ultimo). Ej: ?NoContrato=77&NoContrato=45
   GET /api/{endpoint}/empresas  -> empresas con datos en ese endpoint
 
 Seguridad opcional: si la variable API_KEY esta definida, exige header X-API-Key.
 """
+import json
 import os
+import re
+import threading
+
 import psycopg2
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
@@ -38,10 +44,16 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"],
 pool = None
 
 
+_pool_lock = threading.Lock()
+
+
 def get_pool():
+    """ThreadedConnectionPool (22-oct-2026): FastAPI atiende cada peticion sincrona en un hilo, y SimpleConnectionPool no
+    es seguro entre hilos (con dos peticiones a la vez puede entregar la misma conexion o reventar)."""
     global pool
-    if pool is None:
-        pool = SimpleConnectionPool(1, 8, dsn=DB)
+    with _pool_lock:
+        if pool is None:
+            pool = ThreadedConnectionPool(1, 8, dsn=DB)
     return pool
 
 
@@ -91,9 +103,37 @@ def empresas(endpoint: str, x_api_key: str = Header(None)):
     return rows
 
 
+# Un numero JSON valido: el texto que data->>campo devuelve para un numero se puede volver a leer como ese mismo numero.
+_NUM_JSON = re.compile(r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?$")
+
+
+def _contiene(campo, valores):
+    """Las formas JSON cuyo texto (data->>campo) es cada valor: cadena, numero y verdadero/falso. Con ellas la condicion
+    `data @> {...}` usa el indice GIN, que el `data->>campo = valor` de siempre no puede usar (medido el 22-oct-2026 en
+    produccion: contratos.actas por NoContrato, 267 ms -> 13 ms; 25 contratos juntos, 249 ms contra 4.177 uno a uno).
+    Un valor que empieza por [ o { (texto de un arreglo u objeto) no tiene forma segura: None, y se filtra como antes."""
+    cands = []
+    for v in valores:
+        if v[:1] in ("[", "{"):
+            return None
+        cands.append(json.dumps({campo: v}))
+        if _NUM_JSON.match(v):
+            cands.append("{%s: %s}" % (json.dumps(campo), v))
+        if v in ("true", "false"):
+            cands.append(json.dumps({campo: v == "true"}))
+    return cands
+
+
 def build_filters(endpoint, qp, extra_reservados=()):
     """WHERE + params comunes a /api, /count y /agg. Filtros: empresa, cc, q (texto libre)
-    y <campo>=<valor> exacto sobre el JSON. Devuelve (lista_where, lista_params)."""
+    y <campo>=<valor> exacto sobre el JSON (uno o VARIOS valores: ?Campo=a&Campo=b).
+    `qp` son los parametros de la peticion (QueryParams de Starlette, que guarda los repetidos) o un dict.
+    Devuelve (lista_where, lista_params).
+
+    El filtro exacto va en DOS partes: la contencion JSONB (`data @> ...`, usa el indice GIN) descarta casi todo, y la
+    comparacion de siempre (`data->>campo = ANY(valores)`) decide. Asi el resultado es EXACTAMENTE el de antes —medido
+    en 12 filtros de 12 endpoints el 22-oct-2026, mismas filas— y la consulta deja de recorrer el endpoint entero."""
+    lista = qp.getlist if hasattr(qp, "getlist") else (lambda k: [qp[k]])
     where = ["endpoint = %s"]
     params = [endpoint]
     reservados = RESERVADOS | set(extra_reservados)
@@ -103,9 +143,14 @@ def build_filters(endpoint, qp, extra_reservados=()):
         where.append("cc = %s"); params.append(qp["cc"])
     if qp.get("q"):
         where.append("data::text ILIKE %s"); params.append(f"%{qp['q']}%")
-    for k, v in qp.items():
-        if k not in reservados:
-            where.append("data->>%s = %s"); params.extend([k, v])
+    for k in dict.fromkeys(qp.keys()):
+        if k in reservados:
+            continue
+        valores = list(dict.fromkeys(lista(k)))
+        cands = _contiene(k, valores)
+        if cands:
+            where.append("(" + " OR ".join(["data @> %s::jsonb"] * len(cands)) + ")"); params.extend(cands)
+        where.append("data->>%s = ANY(%s)"); params.extend([k, valores])
     return where, params
 
 
@@ -119,7 +164,7 @@ NUMCAST = ("CASE WHEN (data->>%s) ~ '^-?[0-9]+(\\.[0-9]+)?$' "
 def api(endpoint: str, request: Request, x_api_key: str = Header(None)):
     check_key(x_api_key)
     qp = dict(request.query_params)
-    where, params = build_filters(endpoint, qp)
+    where, params = build_filters(endpoint, request.query_params)
 
     try:
         limit = min(int(qp.get("limit", 500)), 5000)
@@ -146,7 +191,7 @@ def api_count(endpoint: str, request: Request, x_api_key: str = Header(None)):
     """Total de filas que cumplen el filtro, SIN traer los datos. Permite paginar con
     limit/offset sabiendo cuantas paginas hay (antes el cliente no sabia cuando parar)."""
     check_key(x_api_key)
-    where, params = build_filters(endpoint, dict(request.query_params))
+    where, params = build_filters(endpoint, request.query_params)
     n = query(f"SELECT count(*) n FROM datamart WHERE {' AND '.join(where)}", params)[0]["n"]
     return {"endpoint": endpoint, "filas": n}
 
@@ -177,7 +222,7 @@ def api_agg(endpoint: str, request: Request, x_api_key: str = Header(None)):
         sel.append(f"AVG(NULLIF({NUMCAST},0))::float8 AS a{i}"); sel_params.extend([a, a])
     sel.append("count(*) AS n")
 
-    where, where_params = build_filters(endpoint, qp, extra_reservados={"groupby", "sum", "avg"})
+    where, where_params = build_filters(endpoint, request.query_params, extra_reservados={"groupby", "sum", "avg"})
     gb = f" GROUP BY {', '.join(str(i + 1) for i in range(len(groupby)))}" if groupby else ""
     order = " ORDER BY 1" if groupby else ""
     sql = f"SELECT {', '.join(sel)} FROM datamart WHERE {' AND '.join(where)}{gb}{order}"
