@@ -16,6 +16,8 @@ CREATE INDEX IF NOT EXISTS idx_dm_gin    ON datamart USING GIN (data);
 -- (22-oct-2026) La paginacion WHERE endpoint=X ORDER BY id LIMIT/OFFSET recorria la llave primaria entera buscando
 -- el endpoint: contratos.actas?limit=1, 886 ms. Con este indice, 2,8 ms. Lo crea tambien el motor (destino_datamart.py).
 CREATE INDEX IF NOT EXISTS idx_dm_ep_id  ON datamart (endpoint, id);
+-- (23/10/2026) /catalog y / agrupan la tabla entera: con este indice recorren solo el indice (~1 s, antes ~50 s).
+CREATE INDEX IF NOT EXISTS idx_dm_ep_emp_sync ON datamart (endpoint, empresa, sync_at);
 
 -- Control de sincronizacion: que se cargo, cuando, cuantas filas, si fallo.
 CREATE TABLE IF NOT EXISTS sync_log (
